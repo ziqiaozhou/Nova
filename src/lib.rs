@@ -8,6 +8,7 @@
   missing_docs
 )]
 #![allow(non_snake_case)]
+#![feature(stmt_expr_attributes)]
 #![forbid(unsafe_code)]
 
 // main APIs exposed by this library
