@@ -78,13 +78,13 @@ __global__ void reduce6(int *g_in_data, int *g_out_data, unsigned int n){
 */
 
 mod gpu {
-  use halo2curves::group::Group;
-  #[allow(unused_imports)]
-  use gpu::prelude::*;
   #[allow(unused_imports)]
   use gpu::cg::*;
+  #[allow(unused_imports)]
+  use gpu::prelude::*;
   use gpu::reshape_map;
   use gpu::sync_threads;
+  use halo2curves::group::Group;
   use halo2curves::CurveAffine;
   use num_integer::Integer;
   #[gpu::attr(skip_divergence_check)]
@@ -98,20 +98,23 @@ mod gpu {
     let block_dim = block_dim::<DimX>();
     let grid_dim = grid_dim::<DimX>();
     let grid_size = block_dim * grid_dim * 2;
+    let id = tid + block_dim * block_id::<DimX>();
     let smem = smem_alloc.alloc::<C::Curve>(block_dim as usize);
     let mut smem_chunk = smem.chunk_mut(MapLinear::new(1));
     let mut partial_sums_chunk = chunk_mut(
       partial_sums,
       reshape_map!([1] | [(block_dim, 1), grid_dim] => layout: [i0, t1, t0]),
     );
-    let get_data = |idx: u32| if (idx as usize) < scalars.len() && !scalars[idx as usize].is_zero() {
-      bases[idx as usize]
-    } else {
-      C::identity()
+    let get_data = |idx: u32| {
+      if (idx as usize) < scalars.len() && !scalars[idx as usize].is_zero() {
+        bases[idx as usize]
+      } else {
+        C::identity()
+      }
     };
     let mut local_sum = C::Curve::identity();
-    for i in (tid..scalars.len() as u32).step_by(grid_size as usize) {
-      local_sum += get_data(i as u32) + get_data(i as u32 + block_dim);
+    for i in (id..scalars.len() as u32).step_by(grid_size as usize) {
+      local_sum += get_data(i) + get_data(i + grid_size/2);
     }
     smem_chunk[0] = local_sum;
     sync_threads();
@@ -135,23 +138,34 @@ mod gpu {
 
   #[gpu::attr(skip_divergence_check)]
   #[gpu::cuda_kernel(dynamic_shared)]
-  pub fn reduce_sum<C: core::ops::AddAssign + core::ops::Add<Output = C> + Copy + Sync + 'static>(
-    inputs: &[C],
-    partial_sums: &mut [C],
-  ) {
+  pub fn reduce_sum<C, C2>(inputs: &[C], partial_sums: &mut [C2])
+  where
+    C: core::ops::Add<Output = C2> + Copy + Sync + 'static,
+    C2: core::ops::Add<C, Output = C2>
+      + core::ops::Add<Output = C2>
+      + core::ops::AddAssign
+      + Copy
+      + Sync
+      + 'static
+      + Default,
+  {
     let tid = thread_id::<DimX>();
     let block_dim = block_dim::<DimX>();
+    let id = tid + block_dim * block_id::<DimX>();
     let grid_dim = grid_dim::<DimX>();
-    let smem = smem_alloc.alloc::<C>(block_dim as usize);
+    let grid_size = block_dim * grid_dim * 2;
+    let smem = smem_alloc.alloc::<C2>(block_dim as usize);
     let mut smem_chunk = smem.chunk_mut(MapLinear::new(1));
     let mut partial_sums_chunk = chunk_mut(
       partial_sums,
       reshape_map!([1] | [(block_dim, 1), grid_dim] => layout: [i0, t1, t0]),
     );
 
-    for i in (0..inputs.len()).step_by(grid_dim as usize) {
-      smem_chunk[0] = inputs[i as usize] + inputs[i as usize + block_dim as usize];
+    let mut local_sum = C2::default();
+    for i in (id..inputs.len() as u32).step_by(grid_size as usize) {
+      local_sum += inputs[i as usize] + inputs[(i + grid_size/2) as usize];
     }
+    smem_chunk[0] = local_sum;
     sync_threads();
     for order in (0..10).rev() {
       let stride = 1 << order;
@@ -166,6 +180,7 @@ mod gpu {
       sync_threads();
     }
     if tid == 0 {
+      gpu::println!("reduce idx = {}", (partial_sums_chunk.local2global(0)));
       partial_sums_chunk[0] = *smem[0];
     }
   }
@@ -334,10 +349,18 @@ pub fn msm_small_with_max_num_bits<
   }
 }
 
-fn msm_binary<C: CurveAffine, T: Integer + Sync + Copy + Into<u64>>(scalars: &[T], bases: &[C]) -> C::Curve {
-  eprintln!(" size_of::<C::Curve>() = {} {}", std::mem::size_of::<C::Curve>(), std::mem::size_of::<C::CurveExt>());
+fn msm_binary<C: CurveAffine, T: Integer + Sync + Copy + Into<u64>>(
+  scalars: &[T],
+  bases: &[C],
+) -> C::Curve {
+  eprintln!(
+    " size_of::<C::Curve>() = {} {}",
+    std::mem::size_of::<C::Curve>(),
+    std::mem::size_of::<C::CurveExt>()
+  );
   let half_len = scalars.len().div_ceil(2) as u32;
-  let block_dim: u32 = (half_len).min(1024);
+  const MAX_BLOCK_DIM: u32 = 256;
+  let block_dim: u32 = (half_len).min(MAX_BLOCK_DIM);
   let smem_size = (block_dim + 1) * size_of::<C::Curve>() as u32;
   gpu_host::cuda_ctx(0, |ctx, m| {
     let scalars = scalars.iter().map(|&s| s.into()).collect::<Vec<u64>>();
@@ -345,14 +368,30 @@ fn msm_binary<C: CurveAffine, T: Integer + Sync + Copy + Into<u64>>(scalars: &[T
     let d_bases = ctx.new_tensor_view(bases).unwrap();
     let mut grid_size = half_len.div_ceil(block_dim);
     println!("msm_binary: grid_size = {}", grid_size);
-    let mut d_partial_sums = ctx.new_tensor_view(vec![C::Curve::identity(); (grid_size * 2) as usize].as_slice()).unwrap();
+    let mut d_partial_sums = ctx
+      .new_tensor_view(vec![C::Curve::identity(); (grid_size * 2) as usize].as_slice())
+      .unwrap();
     let config = gpu_host::gpu_config!(grid_size, 1, 1, block_dim, 1, 1, smem_size);
-    gpu::msm_binary_kernel::launch(config, ctx, m, &d_scalars, &d_bases, &mut d_partial_sums).unwrap();
+    gpu::msm_binary_kernel::launch(config, ctx, m, &d_scalars, &d_bases, &mut d_partial_sums)
+      .unwrap();
+    let mut sum = vec![C::Curve::identity(); grid_size as usize];
+    let num_threads = current_num_threads();
+    if grid_size as usize <= num_threads {
+      let d_sums = d_partial_sums.split_at(grid_size as usize).0;
+      d_sums.copy_to_host(&mut sum)
+        .expect("copy from device failed");
+      let ret = sum
+        .par_chunks(1)
+        .map(|v| v[0])
+        .reduce(C::Curve::identity, |s, evl| s + evl);
+      return ret;
+    }
+
     let mut sum = C::Curve::identity();
     let mut ret_offset = 0;
     while grid_size > 1 {
       let half_len = grid_size.div_ceil(2);
-      let block_dim: u32 = (half_len).min(1024);
+      let block_dim: u32 = (half_len).min(MAX_BLOCK_DIM);
       grid_size = (half_len).div_ceil(block_dim);
       ret_offset = (half_len * 2) as usize;
       let (cu_sum, mut next_sum) = d_partial_sums.split_at_mut(ret_offset);
@@ -362,9 +401,13 @@ fn msm_binary<C: CurveAffine, T: Integer + Sync + Copy + Into<u64>>(scalars: &[T
         m,
         &cu_sum,
         &mut next_sum,
-      ).expect("reduce_sum kernel launch failed");
+      )
+      .expect("reduce_sum kernel launch failed");
     }
-    d_partial_sums.index(ret_offset).copy_to_host(&mut sum).expect("copy from device failed");
+    d_partial_sums
+      .index(ret_offset)
+      .copy_to_host(&mut sum)
+      .expect("copy from device failed");
     sum
   })
 }
@@ -543,11 +586,11 @@ fn compute_ln(a: usize) -> usize {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use halo2curves::{CurveAffine};
+  use halo2curves::CurveAffine;
   use rand_core::OsRng;
 
   fn test_msm_ux_with<F: PrimeField, A: CurveAffine<ScalarExt = F>>() {
-    let n = 8;
+    let n = 1024;
     let bases = (0..n)
       .map(|_| A::from(A::generator() * F::random(OsRng)))
       .collect::<Vec<_>>();
@@ -577,5 +620,4 @@ mod tests {
     test_msm_ux_with::<secp256k1::Scalar, secp256k1::Affine>();
     test_msm_ux_with::<secq256k1::Scalar, secq256k1::Affine>();*/
   }
-
 }
