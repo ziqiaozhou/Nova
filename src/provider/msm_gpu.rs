@@ -2,80 +2,11 @@
 //! The generic implementation is adapted from halo2; we add an optimization to commit to bits more efficiently
 //! The specialized implementations are adapted from jolt, with additional optimizations and parallelization.
 use ff::{Field, PrimeField};
+use gpu_host::*;
 use halo2curves::{group::Group, CurveAffine};
 use num_integer::Integer;
 use num_traits::{ToPrimitive, Zero};
 use rayon::{current_num_threads, prelude::*};
-
-/*
-n msm_binary<C: CurveAffine, T: Integer + Sync>(scalars: &[T], bases: &[C]) -> C::Curve { assert_eq!(scalars.len(), bases.len()); let num_threads = current_num_threads(); let process_chunk = |scalars: &[T], bases: &[C]| { let mut acc = C::Curve::identity(); scalars .iter() .zip(bases.iter()) .filter(|(scalar, _)| !scalar.is_zero()) .for_each(|(_, base)| { acc += *base; }); acc }; if scalars.len() > num_threads { let chunk = scalars.len() / num_threads; scalars .par_chunks(chunk) .zip(bases.par_chunks(chunk)) .map(|(scalars, bases)| process_chunk(scalars, bases)) .reduce(C::Curve::identity, |sum, evl| sum + evl) } else { process_chunk(scalars, bases) }
-__global__ void msm_binary_kernel(
-    const T* scalars,
-    const C* bases,
-    C* partial_sums,
-    size_t n
-) {
-    extern __shared__ C shared[];
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    C acc = C::identity();
-
-    if (idx < n && !is_zero(scalars[idx])) {
-        acc = bases[idx];
-    }
-
-    // Store in shared memory for reduction
-    shared[threadIdx.x] = acc;
-    __syncthreads();
-
-    // Parallel reduction in shared memory
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            shared[threadIdx.x] = shared[threadIdx.x] + shared[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-
-    // Write block sum to global memory
-    if (threadIdx.x == 0) {
-        partial_sums[blockIdx.x] = shared[0];
-    }
-}
-*/
-/*
-__global__ void reduce6(int *g_in_data, int *g_out_data, unsigned int n){
-    extern __shared__ int sdata[];  // stored in the shared memory
-
-    // Each thread loading one element from global onto shared memory
-    unsigned int tid = threadIdx.x;
-    unsigned int i = blockIdx.x*(blockSize*2) + tid;
-    unsigned int gridSize = blockDim.x * 2 * gridDim.x;
-    sdata[tid] = 0;
-
-    while(i < n) {
-      sdata[tid] += g_in_data[i] + g_in_data[i + blockSize];
-      i += gridSize;
-    }
-    __syncthreads();
-
-    // Perform reductions in steps, reducing thread synchronization
-    if (blockSize >= 512) {
-        if (tid < 256) { sdata[tid] += sdata[tid + 256]; } __syncthreads();
-    }
-    if (blockSize >= 256) {
-        if (tid < 128) { sdata[tid] += sdata[tid + 128]; } __syncthreads();
-    }
-    if (blockSize >= 128) {
-        if (tid < 64) { sdata[tid] += sdata[tid + 64]; } __syncthreads();
-    }
-
-    if (tid < 32) warpReduce<blockSize>(sdata, tid);
-
-    if (tid == 0){
-        g_out_data[blockIdx.x] = sdata[0];
-    }
-}
-*/
 
 mod gpu {
   #[allow(unused_imports)]
@@ -87,9 +18,10 @@ mod gpu {
   use halo2curves::group::Group;
   use halo2curves::CurveAffine;
   use num_integer::Integer;
+  use num_traits::ToPrimitive;
   #[gpu::attr(skip_divergence_check)]
   #[gpu::cuda_kernel(dynamic_shared)]
-  pub fn msm_binary_kernel<C: CurveAffine, T: Integer + Sync + 'static>(
+  pub fn msm_binary_kernel<C: CurveAffine, T: Integer + Sync + ToPrimitive + 'static>(
     scalars: &[T],
     bases: &[C],
     partial_sums: &mut [C::Curve],
@@ -114,7 +46,7 @@ mod gpu {
     };
     let mut local_sum = C::Curve::identity();
     for i in (id..scalars.len() as u32).step_by(grid_size as usize) {
-      local_sum += get_data(i) + get_data(i + grid_size/2);
+      local_sum += get_data(i) + get_data(i + grid_size / 2);
     }
     smem_chunk[0] = local_sum;
     sync_threads();
@@ -163,7 +95,7 @@ mod gpu {
 
     let mut local_sum = C2::default();
     for i in (id..inputs.len() as u32).step_by(grid_size as usize) {
-      local_sum += inputs[i as usize] + inputs[(i + grid_size/2) as usize];
+      local_sum += inputs[i as usize] + inputs[(i + grid_size / 2) as usize];
     }
     smem_chunk[0] = local_sum;
     sync_threads();
@@ -180,7 +112,6 @@ mod gpu {
       sync_threads();
     }
     if tid == 0 {
-      gpu::println!("reduce idx = {}", (partial_sums_chunk.local2global(0)));
       partial_sums_chunk[0] = *smem[0];
     }
   }
@@ -321,7 +252,7 @@ fn num_bits(n: usize) -> usize {
 
 /// Multi-scalar multiplication using the best algorithm for the given scalars.
 #[allow(dead_code)]
-pub fn msm_small<C: CurveAffine, T: Integer + Into<u64> + Copy + Sync + ToPrimitive>(
+pub fn msm_small<C: CurveAffine, T: Integer + Into<u64> + Copy + Sync + ToPrimitive + 'static>(
   scalars: &[T],
   bases: &[C],
 ) -> C::Curve {
@@ -333,7 +264,7 @@ pub fn msm_small<C: CurveAffine, T: Integer + Into<u64> + Copy + Sync + ToPrimit
 #[allow(dead_code)]
 pub fn msm_small_with_max_num_bits<
   C: CurveAffine,
-  T: Integer + Into<u64> + Copy + Sync + ToPrimitive,
+  T: Integer + Into<u64> + Copy + Sync + ToPrimitive + 'static,
 >(
   scalars: &[T],
   bases: &[C],
@@ -349,67 +280,89 @@ pub fn msm_small_with_max_num_bits<
   }
 }
 
-fn msm_binary<C: CurveAffine, T: Integer + Sync + Copy + Into<u64>>(
+fn msm_binary<C: CurveAffine, T: Integer + Sync + Copy + ToPrimitive + 'static>(
   scalars: &[T],
   bases: &[C],
 ) -> C::Curve {
-  eprintln!(
-    " size_of::<C::Curve>() = {} {}",
-    std::mem::size_of::<C::Curve>(),
-    std::mem::size_of::<C::CurveExt>()
-  );
+  gpu_host::cuda_ctx(0, |ctx, m| {
+    msm_binary_gpu(ctx, m, scalars, bases)
+  })
+}
+
+/// MSM using GPU acceleration.
+pub fn msm_binary_gpu<
+  'ctx,
+  'a,
+  C: CurveAffine,
+  T: Integer + Sync + Copy + ToPrimitive + 'static,
+  N: GpuCtxSpace,
+>(
+  ctx: &GpuCtxGuard<'ctx, 'a, N>,
+  m: &GpuModule<N>,
+  scalars: &[T],
+  bases: &[C],
+) -> C::Curve {
+  let start = std::time::Instant::now();
   let half_len = scalars.len().div_ceil(2) as u32;
   const MAX_BLOCK_DIM: u32 = 256;
   let block_dim: u32 = (half_len).min(MAX_BLOCK_DIM);
   let smem_size = (block_dim + 1) * size_of::<C::Curve>() as u32;
-  gpu_host::cuda_ctx(0, |ctx, m| {
-    let scalars = scalars.iter().map(|&s| s.into()).collect::<Vec<u64>>();
-    let d_scalars = ctx.new_tensor_view(scalars.as_slice()).unwrap();
-    let d_bases = ctx.new_tensor_view(bases).unwrap();
-    let mut grid_size = half_len.div_ceil(block_dim);
-    println!("msm_binary: grid_size = {}", grid_size);
-    let mut d_partial_sums = ctx
-      .new_tensor_view(vec![C::Curve::identity(); (grid_size * 2) as usize].as_slice())
-      .unwrap();
+  let mut sum = C::Curve::identity();
+  let mut grid_size = half_len.div_ceil(block_dim);
+  let d_scalars = ctx.new_tensor_view(scalars).unwrap();
+  let d_bases = ctx.new_tensor_view(bases).unwrap();
+  let mut d_partial_sums = ctx
+    .new_tensor_view(vec![C::Curve::identity(); (grid_size * 2) as usize].as_slice())
+    .unwrap();
+  println!("MSM GPU setup time: {:?}", start.elapsed());
+  let start = std::time::Instant::now();
+  for _ in 0..std::env::var("MSM_BINARY_GPU_ITER")
+    .unwrap_or("1".to_string())
+    .parse::<usize>()
+    .unwrap_or(1)
+  {
     let config = gpu_host::gpu_config!(grid_size, 1, 1, block_dim, 1, 1, smem_size);
     gpu::msm_binary_kernel::launch(config, ctx, m, &d_scalars, &d_bases, &mut d_partial_sums)
       .unwrap();
-    let mut sum = vec![C::Curve::identity(); grid_size as usize];
+
     let num_threads = current_num_threads();
     if grid_size as usize <= num_threads {
+      let mut cpu_sums = vec![C::Curve::identity(); grid_size as usize];
       let d_sums = d_partial_sums.split_at(grid_size as usize).0;
-      d_sums.copy_to_host(&mut sum)
+      d_sums
+        .copy_to_host(&mut cpu_sums)
         .expect("copy from device failed");
-      let ret = sum
+      sum = cpu_sums
         .par_chunks(1)
         .map(|v| v[0])
         .reduce(C::Curve::identity, |s, evl| s + evl);
-      return ret;
+    } else {
+      let mut ret_offset = 0;
+      while grid_size > 1 {
+        let half_len = grid_size.div_ceil(2);
+        let block_dim: u32 = (half_len).min(MAX_BLOCK_DIM);
+        grid_size = (half_len).div_ceil(block_dim);
+        ret_offset = (half_len * 2) as usize;
+        let (cu_sum, mut next_sum) = d_partial_sums.split_at_mut(ret_offset);
+        gpu::reduce_sum::launch(
+          gpu_host::gpu_config!(grid_size, 1, 1, block_dim, 1, 1, smem_size),
+          ctx,
+          m,
+          &cu_sum,
+          &mut next_sum,
+        )
+        .expect("reduce_sum kernel launch failed");
+      }
+      d_partial_sums
+        .index(ret_offset)
+        .copy_to_host(&mut sum)
+        .expect("copy from device failed");
+      assert!(!bool::from(sum.is_identity()));
+      ctx.sync().unwrap();
     }
-
-    let mut sum = C::Curve::identity();
-    let mut ret_offset = 0;
-    while grid_size > 1 {
-      let half_len = grid_size.div_ceil(2);
-      let block_dim: u32 = (half_len).min(MAX_BLOCK_DIM);
-      grid_size = (half_len).div_ceil(block_dim);
-      ret_offset = (half_len * 2) as usize;
-      let (cu_sum, mut next_sum) = d_partial_sums.split_at_mut(ret_offset);
-      gpu::reduce_sum::launch(
-        gpu_host::gpu_config!(grid_size, 1, 1, block_dim, 1, 1, smem_size),
-        ctx,
-        m,
-        &cu_sum,
-        &mut next_sum,
-      )
-      .expect("reduce_sum kernel launch failed");
-    }
-    d_partial_sums
-      .index(ret_offset)
-      .copy_to_host(&mut sum)
-      .expect("copy from device failed");
-    sum
-  })
+  }
+  println!("MSM GPU compute time: {:?}", start.elapsed());
+  sum
 }
 
 /// MSM optimized for up to 10-bit scalars
@@ -590,12 +543,12 @@ mod tests {
   use rand_core::OsRng;
 
   fn test_msm_ux_with<F: PrimeField, A: CurveAffine<ScalarExt = F>>() {
-    let n = 1024;
+    let n = 1024 * 16;
     let bases = (0..n)
       .map(|_| A::from(A::generator() * F::random(OsRng)))
       .collect::<Vec<_>>();
 
-    for bit_width in [1, 4, 8, 10, 16, 20, 32, 40] {
+    for bit_width in [1] {
       println!("bit_width: {bit_width}");
       assert!(bit_width <= 64); // Ensure we don't overflow F::from
       let coeffs: Vec<u64> = (0..n)
@@ -603,10 +556,24 @@ mod tests {
         .collect::<Vec<_>>();
       let coeffs_scalar: Vec<F> = coeffs.iter().map(|b| F::from(*b)).collect::<Vec<_>>();
       let general = msm(&coeffs_scalar, &bases);
-      //let integer = msm(&coeffs_scalar, &bases);
-      let integer = msm_small(&coeffs, &bases);
+      let integer = msm_binary(&coeffs, &bases);
 
       assert_eq!(general, integer);
+    }
+  }
+
+  fn test_msm_binary_gpu<F: PrimeField, A: CurveAffine<ScalarExt = F>>() {
+    let n = 1024 * 16;
+    let bases = (0..n)
+      .map(|_| A::from(A::generator() * F::random(OsRng)))
+      .collect::<Vec<_>>();
+
+    for bit_width in [1] {
+      assert!(bit_width <= 64); // Ensure we don't overflow F::from
+      let coeffs: Vec<u64> = (0..n)
+        .map(|_| rand::random::<u64>() % (1 << bit_width))
+        .collect::<Vec<_>>();
+      let _ = msm_binary(&coeffs, &bases);
     }
   }
 
@@ -619,5 +586,10 @@ mod tests {
     test_msm_ux_with::<grumpkin::Scalar, grumpkin::Affine>();
     test_msm_ux_with::<secp256k1::Scalar, secp256k1::Affine>();
     test_msm_ux_with::<secq256k1::Scalar, secq256k1::Affine>();*/
+  }
+
+  #[test]
+  fn test_gpu_msm_ux_2() {
+    test_msm_binary_gpu::<halo2curves::bn256::Fr, halo2curves::bn256::G1Affine>();
   }
 }

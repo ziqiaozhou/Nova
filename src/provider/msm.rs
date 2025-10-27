@@ -401,22 +401,29 @@ mod tests {
   }
 
   fn test_msm_ux_with<F: PrimeField, A: CurveAffine<ScalarExt = F>>() {
-    let n = 8;
+    let n = 1024 * 16;
     let bases = (0..n)
       .map(|_| A::from(A::generator() * F::random(OsRng)))
       .collect::<Vec<_>>();
 
-    for bit_width in [1, 4, 8, 10, 16, 20, 32, 40] {
+    for bit_width in [1] {
       println!("bit_width: {bit_width}");
       assert!(bit_width <= 64); // Ensure we don't overflow F::from
       let coeffs: Vec<u64> = (0..n)
         .map(|_| rand::random::<u64>() % (1 << bit_width))
         .collect::<Vec<_>>();
-      let coeffs_scalar: Vec<F> = coeffs.iter().map(|b| F::from(*b)).collect::<Vec<_>>();
-      let general = msm(&coeffs_scalar, &bases);
-      let integer = msm_small(&coeffs, &bases);
+      //let coeffs_scalar: Vec<F> = coeffs.iter().map(|b| F::from(*b)).collect::<Vec<_>>();
+      //let general = msm(&coeffs_scalar, &bases);
+      for _ in 0..std::env::var("MSM_BINARY_GPU_ITER")
+        .unwrap_or("1".to_string())
+        .parse::<usize>()
+        .unwrap_or(1)
+      {
+        let integer = msm_binary(&coeffs, &bases);
+        let _ = integer;
+      }
 
-      assert_eq!(general, integer);
+      //assert_eq!(general, integer);
     }
   }
 

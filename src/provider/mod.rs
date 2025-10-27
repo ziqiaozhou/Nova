@@ -17,9 +17,9 @@ pub(crate) mod pedersen;
 pub(crate) mod ptau;
 pub(crate) mod traits;
 
-mod msm;
+pub mod msm;
 #[cfg(feature = "gpu")]
-mod msm_gpu;
+pub mod msm_gpu;
 
 use crate::{
   provider::{
