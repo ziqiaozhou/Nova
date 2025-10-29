@@ -61,7 +61,7 @@ fn msm_benchmark<F: PrimeField, A: CurveAffine<ScalarExt = F>>(name: &str, c: &m
     4 * 1024 * 1024,
     16 * 1024 * 1024,
   ];
-  let bit_width = 16; // use more realistic scalar bit width
+  let bit_width = 1;
 
   let mut group = c.benchmark_group(format!("MSM-{}", name));
 
