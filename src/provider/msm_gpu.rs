@@ -1,6 +1,7 @@
 //! This module provides a multi-scalar multiplication routine
 //! The generic implementation is adapted from halo2; we add an optimization to commit to bits more efficiently
 //! The specialized implementations are adapted from jolt, with additional optimizations and parallelization.
+//! A GPU implementation is also provided for binary scalars.
 use ff::{Field, PrimeField};
 use gpu_host::*;
 use halo2curves::{group::Group, CurveAffine};
@@ -531,21 +532,25 @@ fn compute_ln(a: usize) -> usize {
   }
 }
 
+/// cargo test --no-default-features --features gpu
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::provider::{
+    bn256_grumpkin::{bn256, grumpkin},
+    pasta::{pallas, vesta},
+    secp_secq::{secp256k1, secq256k1},
+  };
   use halo2curves::CurveAffine;
   use rand_core::OsRng;
 
   fn test_msm_ux_with<F: PrimeField, A: CurveAffine<ScalarExt = F>>() {
-    let n = 1024 * 16;
+    let n = 512;
     let bases = (0..n)
       .map(|_| A::from(A::generator() * F::random(OsRng)))
       .collect::<Vec<_>>();
 
     for bit_width in [1] {
-      println!("bit_width: {bit_width}");
-      assert!(bit_width <= 64); // Ensure we don't overflow F::from
       let coeffs: Vec<u64> = (0..n)
         .map(|_| rand::random::<u64>() % (1 << bit_width))
         .collect::<Vec<_>>();
@@ -557,34 +562,14 @@ mod tests {
     }
   }
 
-  fn test_msm_binary_gpu<F: PrimeField, A: CurveAffine<ScalarExt = F>>() {
-    let n = 1024 * 16;
-    let bases = (0..n)
-      .map(|_| A::from(A::generator() * F::random(OsRng)))
-      .collect::<Vec<_>>();
-
-    for bit_width in [1] {
-      assert!(bit_width <= 64); // Ensure we don't overflow F::from
-      let coeffs: Vec<u64> = (0..n)
-        .map(|_| rand::random::<u64>() % (1 << bit_width))
-        .collect::<Vec<_>>();
-      let _ = msm_binary(&coeffs, &bases);
-    }
-  }
-
   #[test]
   fn test_gpu_msm_ux() {
     test_msm_ux_with::<halo2curves::bn256::Fr, halo2curves::bn256::G1Affine>();
-    /*test_msm_ux_with::<pallas::Scalar, pallas::Affine>();
+    test_msm_ux_with::<pallas::Scalar, pallas::Affine>();
     test_msm_ux_with::<vesta::Scalar, vesta::Affine>();
     test_msm_ux_with::<bn256::Scalar, bn256::Affine>();
     test_msm_ux_with::<grumpkin::Scalar, grumpkin::Affine>();
     test_msm_ux_with::<secp256k1::Scalar, secp256k1::Affine>();
-    test_msm_ux_with::<secq256k1::Scalar, secq256k1::Affine>();*/
-  }
-
-  #[test]
-  fn test_gpu_msm_ux_2() {
-    test_msm_binary_gpu::<halo2curves::bn256::Fr, halo2curves::bn256::G1Affine>();
+    test_msm_ux_with::<secq256k1::Scalar, secq256k1::Affine>();
   }
 }

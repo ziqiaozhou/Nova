@@ -9,6 +9,7 @@ use rand_core::OsRng;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::time::Duration;
 
+// cargo criterion --bench --no-default-features --features gpu --bench msm-gpu
 // ---------------------------------------------------------
 // Criterion setup
 // ---------------------------------------------------------
