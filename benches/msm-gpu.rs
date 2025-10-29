@@ -2,8 +2,9 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use ff::{Field, PrimeField};
 use halo2curves::{group::Group, CurveAffine};
 use nova_snark::provider;
-use nova_snark::provider::bn256_grumpkin::bn256;
-use nova_snark::provider::pasta::vesta;
+use nova_snark::provider::bn256_grumpkin::{bn256, grumpkin};
+use nova_snark::provider::pasta::{pallas, vesta};
+use nova_snark::provider::secp_secq::{secp256k1, secq256k1};
 use provider::{msm, msm_gpu};
 use rand_core::OsRng;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -116,4 +117,7 @@ fn msm_benchmark<F: PrimeField, A: CurveAffine<ScalarExt = F>>(name: &str, c: &m
 fn msm_benchmarks(c: &mut Criterion) {
   msm_benchmark::<bn256::Scalar, bn256::Affine>("bn256", c);
   msm_benchmark::<vesta::Scalar, vesta::Affine>("vesta", c);
+  msm_benchmark::<grumpkin::Scalar, grumpkin::Affine>("grumpkin", c);
+  msm_benchmark::<secp256k1::Scalar, secp256k1::Affine>("secp256k1", c);
+  msm_benchmark::<secq256k1::Scalar, secq256k1::Affine>("secq256k1", c);
 }
