@@ -71,6 +71,51 @@ mod gpu {
 
   #[gpu::attr(skip_divergence_check)]
   #[gpu::cuda_kernel(dynamic_shared)]
+  pub fn msm_kernel<C: CurveAffine>(
+    scalars: &[C::Scalar],
+    bases: &[C],
+    partial_sums: &mut [C::Curve],
+  ) {
+    let tid = thread_id::<DimX>();
+    let block_dim = block_dim::<DimX>();
+    let grid_dim = grid_dim::<DimX>();
+    let grid_size = block_dim * grid_dim * 2;
+    let id = tid + block_dim * block_id::<DimX>();
+    let smem = smem_alloc.alloc::<C::Curve>(block_dim as usize);
+    let mut smem_chunk = smem.chunk_mut(MapLinear::new(1));
+    let mut partial_sums_chunk = chunk_mut(
+      partial_sums,
+      reshape_map!([1] | [(block_dim, 1), grid_dim] => layout: [i0, t1, t0]),
+    );
+    let get_data = |idx: u32| {
+      bases[idx as usize] * scalars[idx as usize]
+    };
+    let mut local_sum = C::Curve::identity();
+    for i in (id..scalars.len() as u32).step_by(grid_size as usize) {
+      local_sum += get_data(i) + get_data(i + grid_size / 2);
+    }
+    smem_chunk[0] = local_sum;
+    sync_threads();
+
+    for order in (0..10).rev() {
+      let stride = 1 << order;
+      if stride >= block_dim {
+        continue;
+      }
+      let mut smem_chunk = smem.chunk_mut(reshape_map!([2] | [stride] => layout: [t0, i0]));
+      if tid < stride {
+        let tmp = smem_chunk[1];
+        smem_chunk[0] += tmp;
+      }
+      sync_threads();
+    }
+    if tid == 0 {
+      partial_sums_chunk[0] = *smem[0];
+    }
+  }
+
+  #[gpu::attr(skip_divergence_check)]
+  #[gpu::cuda_kernel(dynamic_shared)]
   pub fn reduce_sum<C, C2>(inputs: &[C], partial_sums: &mut [C2])
   where
     C: core::ops::Add<Output = C2> + Copy + Sync + 'static,
@@ -229,17 +274,18 @@ fn cpu_msm_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve
 pub fn msm<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
   assert_eq!(coeffs.len(), bases.len());
 
-  let num_threads = current_num_threads();
-  if coeffs.len() > num_threads {
-    let chunk = coeffs.len() / num_threads;
-    coeffs
-      .par_chunks(chunk)
-      .zip(bases.par_chunks(chunk))
-      .map(|(coeffs, bases)| cpu_msm_serial(coeffs, bases))
-      .reduce(C::Curve::identity, |sum, evl| sum + evl)
-  } else {
-    cpu_msm_serial(coeffs, bases)
-  }
+  gpu_host::cuda_ctx(0, |ctx, m| {
+    let half_len = bases.len().div_ceil(2) as u32;
+    const MAX_BLOCK_DIM: u32 = 256;
+    let block_dim: u32 = (half_len).min(MAX_BLOCK_DIM);
+    let grid_size = half_len.div_ceil(block_dim);
+    let d_bases = ctx.new_tensor_view(bases).unwrap();
+    let mut d_partial_sums = ctx
+      .new_tensor_view(vec![C::Curve::identity(); (grid_size * 2) as usize].as_slice())
+      .unwrap();
+    let d_scalars = ctx.new_tensor_view(coeffs).unwrap();
+    msm_gpu(ctx, m, &d_scalars, &d_bases, &mut d_partial_sums)
+  })
 }
 
 #[allow(dead_code)]
@@ -322,6 +368,67 @@ pub fn msm_binary_gpu<
   assert!(d_partial_sums.len() == d_bases.len().div_ceil(block_dim as usize));
   let config = gpu_host::gpu_config!(grid_size, 1, 1, block_dim, 1, 1, smem_size);
   gpu::msm_binary_kernel::launch(config, ctx, m, d_scalars, d_bases, d_partial_sums).unwrap();
+
+  let num_threads = current_num_threads();
+  if grid_size as usize <= num_threads {
+    let mut cpu_sums = vec![C::Curve::identity(); grid_size as usize];
+    let d_sums = d_partial_sums.split_at(grid_size as usize).0;
+    d_sums
+      .copy_to_host(&mut cpu_sums)
+      .expect("copy from device failed");
+    sum = cpu_sums
+      .par_chunks(1)
+      .map(|v| v[0])
+      .reduce(C::Curve::identity, |s, evl| s + evl);
+  } else {
+    let mut ret_offset = 0;
+    while grid_size > 1 {
+      let half_len = grid_size.div_ceil(2);
+      let block_dim: u32 = (half_len).min(MAX_BLOCK_DIM);
+      grid_size = (half_len).div_ceil(block_dim);
+      ret_offset = (half_len * 2) as usize;
+      let (cu_sum, mut next_sum) = d_partial_sums.split_at_mut(ret_offset);
+      gpu::reduce_sum::launch(
+        gpu_host::gpu_config!(grid_size, 1, 1, block_dim, 1, 1, smem_size),
+        ctx,
+        m,
+        &cu_sum,
+        &mut next_sum,
+      )
+      .expect("reduce_sum kernel launch failed");
+    }
+    d_partial_sums
+      .index(ret_offset)
+      .copy_to_host(&mut sum)
+      .expect("copy from device failed");
+    assert!(!bool::from(sum.is_identity()));
+    ctx.sync().unwrap();
+  }
+  sum
+}
+
+/// MSM using GPU acceleration.
+pub fn msm_gpu<
+  'ctx,
+  'a,
+  C: CurveAffine,
+  N: GpuCtxSpace,
+>(
+  ctx: &GpuCtxGuard<'ctx, 'a, N>,
+  m: &GpuModule<N>,
+  d_scalars: &TensorView<'a, [C::Scalar]>,
+  d_bases: &TensorView<'a, [C]>,
+  d_partial_sums: &mut TensorViewMut<'a, [C::Curve]>,
+) -> C::Curve {
+  let half_len = d_bases.len().div_ceil(2) as u32;
+  const MAX_BLOCK_DIM: u32 = 256; // smaller than 1024 to fit smem_size in shared memory
+  let block_dim: u32 = (half_len).min(MAX_BLOCK_DIM);
+  let smem_size = (block_dim + 1) * size_of::<C::Curve>() as u32;
+  let mut sum = C::Curve::identity();
+  let mut grid_size = half_len.div_ceil(block_dim);
+  assert!(d_partial_sums.len() == d_bases.len().div_ceil(block_dim as usize));
+  let config = gpu_host::gpu_config!(grid_size, 1, 1, block_dim, 1, 1, smem_size);
+  gpu::msm_kernel::launch(config, ctx, m, d_scalars, d_bases, d_partial_sums).unwrap();
 
   let num_threads = current_num_threads();
   if grid_size as usize <= num_threads {
