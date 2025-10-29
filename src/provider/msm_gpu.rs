@@ -285,7 +285,16 @@ fn msm_binary<C: CurveAffine, T: Integer + Sync + Copy + ToPrimitive + 'static>(
   bases: &[C],
 ) -> C::Curve {
   gpu_host::cuda_ctx(0, |ctx, m| {
-    msm_binary_gpu(ctx, m, scalars, bases)
+    let half_len = bases.len().div_ceil(2) as u32;
+    const MAX_BLOCK_DIM: u32 = 256;
+    let block_dim: u32 = (half_len).min(MAX_BLOCK_DIM);
+    let grid_size = half_len.div_ceil(block_dim);
+    let d_bases = ctx.new_tensor_view(bases).unwrap();
+    let mut d_partial_sums = ctx
+      .new_tensor_view(vec![C::Curve::identity(); (grid_size * 2) as usize].as_slice())
+      .unwrap();
+    let d_scalars = ctx.new_tensor_view(scalars).unwrap();
+    msm_binary_gpu(ctx, m, &d_scalars, &d_bases, &mut d_partial_sums)
   })
 }
 
@@ -299,69 +308,55 @@ pub fn msm_binary_gpu<
 >(
   ctx: &GpuCtxGuard<'ctx, 'a, N>,
   m: &GpuModule<N>,
-  scalars: &[T],
-  bases: &[C],
+  d_scalars: &TensorView<'a, [T]>,
+  d_bases: &TensorView<'a, [C]>,
+  d_partial_sums: &mut TensorViewMut<'a, [C::Curve]>,
 ) -> C::Curve {
-  let start = std::time::Instant::now();
-  let half_len = scalars.len().div_ceil(2) as u32;
-  const MAX_BLOCK_DIM: u32 = 256;
+  let half_len = d_bases.len().div_ceil(2) as u32;
+  const MAX_BLOCK_DIM: u32 = 256; // smaller than 1024 to fit smem_size in shared memory
   let block_dim: u32 = (half_len).min(MAX_BLOCK_DIM);
   let smem_size = (block_dim + 1) * size_of::<C::Curve>() as u32;
   let mut sum = C::Curve::identity();
   let mut grid_size = half_len.div_ceil(block_dim);
-  let d_scalars = ctx.new_tensor_view(scalars).unwrap();
-  let d_bases = ctx.new_tensor_view(bases).unwrap();
-  let mut d_partial_sums = ctx
-    .new_tensor_view(vec![C::Curve::identity(); (grid_size * 2) as usize].as_slice())
-    .unwrap();
-  println!("MSM GPU setup time: {:?}", start.elapsed());
-  let start = std::time::Instant::now();
-  for _ in 0..std::env::var("MSM_BINARY_GPU_ITER")
-    .unwrap_or("1".to_string())
-    .parse::<usize>()
-    .unwrap_or(1)
-  {
-    let config = gpu_host::gpu_config!(grid_size, 1, 1, block_dim, 1, 1, smem_size);
-    gpu::msm_binary_kernel::launch(config, ctx, m, &d_scalars, &d_bases, &mut d_partial_sums)
-      .unwrap();
+  assert!(d_partial_sums.len() == d_bases.len().div_ceil(block_dim as usize));
+  let config = gpu_host::gpu_config!(grid_size, 1, 1, block_dim, 1, 1, smem_size);
+  gpu::msm_binary_kernel::launch(config, ctx, m, d_scalars, d_bases, d_partial_sums).unwrap();
 
-    let num_threads = current_num_threads();
-    if grid_size as usize <= num_threads {
-      let mut cpu_sums = vec![C::Curve::identity(); grid_size as usize];
-      let d_sums = d_partial_sums.split_at(grid_size as usize).0;
-      d_sums
-        .copy_to_host(&mut cpu_sums)
-        .expect("copy from device failed");
-      sum = cpu_sums
-        .par_chunks(1)
-        .map(|v| v[0])
-        .reduce(C::Curve::identity, |s, evl| s + evl);
-    } else {
-      let mut ret_offset = 0;
-      while grid_size > 1 {
-        let half_len = grid_size.div_ceil(2);
-        let block_dim: u32 = (half_len).min(MAX_BLOCK_DIM);
-        grid_size = (half_len).div_ceil(block_dim);
-        ret_offset = (half_len * 2) as usize;
-        let (cu_sum, mut next_sum) = d_partial_sums.split_at_mut(ret_offset);
-        gpu::reduce_sum::launch(
-          gpu_host::gpu_config!(grid_size, 1, 1, block_dim, 1, 1, smem_size),
-          ctx,
-          m,
-          &cu_sum,
-          &mut next_sum,
-        )
-        .expect("reduce_sum kernel launch failed");
-      }
-      d_partial_sums
-        .index(ret_offset)
-        .copy_to_host(&mut sum)
-        .expect("copy from device failed");
-      assert!(!bool::from(sum.is_identity()));
-      ctx.sync().unwrap();
+  let num_threads = current_num_threads();
+  if grid_size as usize <= num_threads {
+    let mut cpu_sums = vec![C::Curve::identity(); grid_size as usize];
+    let d_sums = d_partial_sums.split_at(grid_size as usize).0;
+    d_sums
+      .copy_to_host(&mut cpu_sums)
+      .expect("copy from device failed");
+    sum = cpu_sums
+      .par_chunks(1)
+      .map(|v| v[0])
+      .reduce(C::Curve::identity, |s, evl| s + evl);
+  } else {
+    let mut ret_offset = 0;
+    while grid_size > 1 {
+      let half_len = grid_size.div_ceil(2);
+      let block_dim: u32 = (half_len).min(MAX_BLOCK_DIM);
+      grid_size = (half_len).div_ceil(block_dim);
+      ret_offset = (half_len * 2) as usize;
+      let (cu_sum, mut next_sum) = d_partial_sums.split_at_mut(ret_offset);
+      gpu::reduce_sum::launch(
+        gpu_host::gpu_config!(grid_size, 1, 1, block_dim, 1, 1, smem_size),
+        ctx,
+        m,
+        &cu_sum,
+        &mut next_sum,
+      )
+      .expect("reduce_sum kernel launch failed");
     }
+    d_partial_sums
+      .index(ret_offset)
+      .copy_to_host(&mut sum)
+      .expect("copy from device failed");
+    assert!(!bool::from(sum.is_identity()));
+    ctx.sync().unwrap();
   }
-  println!("MSM GPU compute time: {:?}", start.elapsed());
   sum
 }
 

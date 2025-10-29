@@ -80,6 +80,11 @@ harness = false
 name = "sumcheckeq"
 harness = false
 
+[[bench]]
+name = "msm-gpu"
+harness = false
+
+
 [features]
 default = ["halo2curves/asm"]
 flamegraph = ["pprof2/flamegraph", "pprof2/criterion"]
