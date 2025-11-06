@@ -54,8 +54,8 @@ rand = "0.8.5"
 expect-test = "1.5.1"
 
 [patch.crates-io]
-halo2curves = {path = "../halo2curves"}
-#halo2curves = { git = "https://github.com/ziqiaozhou/halo2curves", rev="3b5a9b0e6c80950ef3046c721cd758e03260f445" }
+#halo2curves = {path = "../halo2curves"}
+halo2curves = { git = "https://github.com/ziqiaozhou/halo2curves", rev="124a6554654b7a0a1909076f1d1a9fb372dfeac3" }
 
 [[bench]]
 name = "recursive-snark"
