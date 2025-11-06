@@ -614,10 +614,8 @@ mod tests {
 
     //.map(|_| rand::random::<u64>() 1% (1 << bit_width))
     for bit_width in [1] {
-      let coeffs: Vec<u64> = (0..n)
-        .map(|_| 1% (1 << bit_width))
-        .collect::<Vec<_>>();
-     
+      let coeffs: Vec<u64> = (0..n).map(|_| 1 % (1 << bit_width)).collect::<Vec<_>>();
+
       let coeffs_scalar: Vec<F> = coeffs.iter().map(|b| F::from(*b)).collect::<Vec<_>>();
       let general_cpu = crate::provider::msm::msm(&coeffs_scalar, &bases);
       let general_gpu = msm_gpu(&coeffs_scalar, &bases);

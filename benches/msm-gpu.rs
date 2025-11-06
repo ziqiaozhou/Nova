@@ -66,7 +66,6 @@ fn msm_benchmark<F: PrimeField, A: CurveAffine<ScalarExt = F>>(name: &str, c: &m
     4 * 1024 * 1024,
     16 * 1024 * 1024,
   ];
-  let bit_width = 1;
 
   let mut group = c.benchmark_group(format!("MSM-{}", name));
 
@@ -81,11 +80,7 @@ fn msm_benchmark<F: PrimeField, A: CurveAffine<ScalarExt = F>>(name: &str, c: &m
         &n,
         |b, &_size| {
           b.iter(|| {
-            let _ = if bit_width == 1 {
-              msm::msm_small(&coeffs, &bases);
-            } else {
-              //msm::msm(&coeffs, &bases);
-            };
+            let _ = msm::msm_small(&coeffs, &bases);
           });
         },
       );
@@ -109,17 +104,58 @@ fn msm_benchmark<F: PrimeField, A: CurveAffine<ScalarExt = F>>(name: &str, c: &m
           |b, &_size| {
             b.iter(|| {
               d_scalars.copy_from_host(coeffs.as_slice()).unwrap();
-              let _ = if bit_width == 1 {
-                msm_gpu::msm_binary_gpu(ctx, m, &d_scalars, &d_bases, &mut d_partial_sums);
-              } else {
-                //msm_gpu::msm_gpu_inner(ctx, m, &d_scalars, &d_bases, &mut d_partial_sums);
-              };
+              let _ = msm_gpu::msm_binary_gpu(ctx, m, &d_scalars, &d_bases, &mut d_partial_sums);
             });
           },
         );
       });
     }
   }
+
+  /*
+  for bit_width in [16, 32, 48, 63] {
+    for &n in &sizes {
+      println!("Preparing data for {} elements...", n);
+      let (bases, coeffs) = prepare_data::<F, A, F>(n, bit_width);
+
+      // CPU benchmark
+      group.bench_with_input(
+        BenchmarkId::new(format!("{}-CPU", name), n),
+        &n,
+        |b, &_size| {
+          b.iter(|| {
+            let _ = msm::msm(&coeffs, &bases);
+          });
+        },
+      );
+
+      #[cfg(feature = "gpu")]
+      // GPU benchmark
+      gpu_host::cuda_ctx(0, |ctx, m| {
+        let half_len = (bases.len() + 1) / 2;
+        let block_dim = (half_len as u32).min(msm_gpu::MAX_BLOCK_DIM);
+        let grid_size = (half_len as u32 + block_dim - 1) / block_dim;
+
+        // Allocate GPU buffers
+        let d_bases = ctx.new_tensor_view(bases.as_slice()).unwrap();
+        let mut d_partial_sums = ctx
+          .new_tensor_view(vec![A::Curve::identity(); (grid_size * 2) as usize].as_slice())
+          .unwrap();
+        let mut d_scalars = ctx.new_tensor_view(coeffs.as_slice()).unwrap();
+        group.bench_with_input(
+          BenchmarkId::new(format!("n-{}-GPU", name), n),
+          &n,
+          |b, &_size| {
+            b.iter(|| {
+              d_scalars.copy_from_host(coeffs.as_slice()).unwrap();
+              let _ = msm_gpu::msm_gpu_inner(ctx, m, &d_scalars, &d_bases, &mut d_partial_sums);
+            });
+          },
+        );
+      });
+    }
+  }
+  */
 
   group.finish();
 }
@@ -143,7 +179,9 @@ fn blitzar_benchmark(c: &mut Criterion) {
 
   for &n in &sizes {
     let (bases, coeffs) =
-      prepare_data::<halo2curves::bn256::Fr, halo2curves::bn256::G1Affine, halo2curves::bn256::Fr>(n, bit_width);
+      prepare_data::<halo2curves::bn256::Fr, halo2curves::bn256::G1Affine, halo2curves::bn256::Fr>(
+        n, bit_width,
+      );
     let coeffs4 = [coeffs.clone(), coeffs.clone(), coeffs.clone(), coeffs];
     let coeffs1 = &coeffs4[0..1];
     // blitzar GPU benchmark
@@ -176,8 +214,8 @@ fn blitzar_benchmark(c: &mut Criterion) {
 fn msm_benchmarks(c: &mut Criterion) {
   #[cfg(feature = "blitzar")]
   blitzar_benchmark(c);
-  msm_benchmark::<bn256::Scalar, bn256::Affine>("bn256", c);
   msm_benchmark::<vesta::Scalar, vesta::Affine>("vesta", c);
+  msm_benchmark::<bn256::Scalar, bn256::Affine>("bn256", c);
   msm_benchmark::<grumpkin::Scalar, grumpkin::Affine>("grumpkin", c);
   msm_benchmark::<secp256k1::Scalar, secp256k1::Affine>("secp256k1", c);
   msm_benchmark::<secq256k1::Scalar, secq256k1::Affine>("secq256k1", c);
