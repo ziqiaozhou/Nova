@@ -13,6 +13,7 @@ use rayon::{current_num_threads, prelude::*};
 pub const MAX_BLOCK_DIM: u32 = 256;
 
 mod rs_gpu {
+  use super::*;
   #[allow(unused_imports)]
   use gpu::cg::*;
   #[allow(unused_imports)]
@@ -83,6 +84,97 @@ mod rs_gpu {
     partial_sums_chunk[0] = bases[i] * scalars[i];
   }
 
+  #[gpu::cuda_kernel]
+  pub fn msm_kernel_opt<C: CurveAffine>(
+    coeffs: &[C::Scalar],
+    bases: &[C],
+    partial_sums: &mut [C::Curve],
+  ) {
+    let c = if bases.len() < 4 {
+      1
+    } else if bases.len() < 32 {
+      3
+    } else {
+      (f64::from(bases.len() as u32)).ln().ceil() as usize
+    };
+
+    let tid = thread_id::<DimX>();
+    let block_dim = block_dim::<DimX>();
+    let grid_dim = grid_dim::<DimX>();
+    let grid_size = block_dim * grid_dim;
+    let id = tid + block_dim * block_id::<DimX>();
+    let mut partial_sums_chunk = chunk_mut(
+      partial_sums,
+      MapContinuousLinear::new(1),
+    );
+    let get_data = |idx: u32| {
+      if (idx as usize) < coeffs.len() && coeffs[idx as usize] == C::Scalar::ONE {
+        bases[idx as usize]
+      } else {
+        C::identity()
+      }
+    };
+
+    let get_at = |segment: usize, c: usize, bytes: &<C::Scalar as ff::PrimeField>::Repr| {
+      let skip_bits = segment * c;
+      let skip_bytes = skip_bits / 8;
+
+      if skip_bytes >= 32 {
+        return 0;
+      }
+
+      let mut v = [0; 8];
+      let bytes_ref = &bytes.as_ref()[skip_bytes..];
+      if bytes_ref.is_empty() {
+        return 0;
+      }
+      for i in 0..8 {
+        if i >= bytes_ref.len() {
+          break;
+        }
+        v[i] = bytes_ref[i];
+      }
+
+      let mut tmp = u64::from_le_bytes(v);
+      tmp >>= skip_bits - (skip_bytes * 8);
+      tmp %= 1 << c;
+
+      tmp as usize
+    };
+    let mut local_boolean_sum = C::Curve::identity();
+    //for i in (id..coeffs.len() as u32).step_by(grid_size as usize) {
+      local_boolean_sum += get_data(id);
+    //}
+
+    let mut local_non_boolean_sum = C::Curve::identity();
+    let segments = (256 / c) + 1;
+    for i in 0..segments {
+      let segment = i as usize;
+      let mut buckets = [Bucket::None; 1<<14 - 1]; // assuming c=(u32::MAX as f64).ln().ceil() <= 14.
+      //for j in (id..coeffs.len() as u32).step_by(grid_size as usize) {
+      let j = id;
+        let idx = j + segment as u32 * grid_size;
+        if (idx as usize) < coeffs.len() {
+          let coeff = &coeffs[idx as usize];
+          if *coeff != C::Scalar::ZERO && *coeff != C::Scalar::ONE {
+            let coeff = get_at(segment, c, &coeff.to_repr());
+            if coeff != 0 {
+              buckets[coeff - 1].add_assign(&bases[idx as usize]);
+            }
+          }
+        }
+      //}
+      let mut running_sum = C::Curve::identity();
+      buckets.into_iter().rev().for_each(|exp| {
+        running_sum = exp.add(running_sum);
+        local_non_boolean_sum += &running_sum;
+      });
+    }
+
+    partial_sums_chunk[0] += local_boolean_sum + local_non_boolean_sum;
+  }
+
+
   #[gpu::cuda_kernel(dynamic_shared)]
   pub fn reduce_sum<C, C2>(inputs: &[C], partial_sums: &mut [C2])
   where
@@ -141,6 +233,8 @@ enum Bucket<C: CurveAffine> {
 
 impl<C: CurveAffine> Bucket<C> {
   #[allow(dead_code)]
+  #[inline]
+  #[gpu::device]
   fn add_assign(&mut self, other: &C) {
     *self = match *self {
       Bucket::None => Bucket::Affine(*other),
@@ -150,6 +244,7 @@ impl<C: CurveAffine> Bucket<C> {
   }
 
   #[allow(dead_code)]
+  #[gpu::device]
   fn add(self, other: C::Curve) -> C::Curve {
     match self {
       Bucket::None => other,
@@ -249,6 +344,21 @@ pub fn msm_gpu<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
       .unwrap();
     let d_scalars = ctx.new_tensor_view(coeffs).unwrap();
     msm_gpu_inner(ctx, m, &d_scalars, &d_bases, &mut d_partial_sums)
+  })
+}
+
+/// Performs a multi-scalar-multiplication operation with GPU acceleration.
+#[allow(dead_code)]
+pub fn msm_gpu_opt<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
+  assert_eq!(coeffs.len(), bases.len());
+
+  gpu_host::cuda_ctx(0, |ctx, m| {
+    let d_bases = ctx.new_tensor_view(bases).unwrap();
+    let mut d_partial_sums = ctx
+      .new_tensor_view(vec![C::Curve::identity(); bases.len() * 2].as_slice())
+      .unwrap();
+    let d_scalars = ctx.new_tensor_view(coeffs).unwrap();
+    msm_gpu_opt_inner(ctx, m, &d_scalars, &d_bases, &mut d_partial_sums)
   })
 }
 
@@ -396,14 +506,17 @@ pub fn msm_gpu_inner<'ctx, 'a, C: CurveAffine, N: GpuCtxSpace>(
       .reduce(C::Curve::identity, |s, evl| s + evl);
   } else {
     let mut ret_offset = 0;
+    let mut sums_start = 0;
     while result_size > 1 {
+      sums_start += ret_offset;
       ret_offset = result_size as usize;
       let half_len = result_size.div_ceil(2);
       let block_dim: u32 = (half_len).min(MAX_BLOCK_DIM);
       grid_size = (half_len).div_ceil(block_dim);
       result_size = grid_size;
       let smem_size = (block_dim + 1) * size_of::<C::Curve>() as u32;
-      let (cu_sum, mut next_sum) = d_partial_sums.split_at_mut(ret_offset);
+      let (_, mut sum) = d_partial_sums.split_at_mut(sums_start);
+      let (cu_sum, mut next_sum) = sum.split_at_mut(ret_offset);
       rs_gpu::reduce_sum::launch(
         gpu_host::gpu_config!(grid_size, 1, 1, block_dim, 1, 1, smem_size),
         ctx,
@@ -413,11 +526,70 @@ pub fn msm_gpu_inner<'ctx, 'a, C: CurveAffine, N: GpuCtxSpace>(
       )
       .expect("reduce_sum kernel launch failed");
     }
+    ctx.sync().unwrap();
     d_partial_sums
-      .index(ret_offset)
+      .index(sums_start + ret_offset)
       .copy_to_host(&mut sum)
       .expect("copy from device failed");
+  }
+  sum
+}
+
+/// bucket-based MSM using GPU acceleration.
+pub fn msm_gpu_opt_inner<'ctx, 'a, C: CurveAffine, N: GpuCtxSpace>(
+  ctx: &GpuCtxGuard<'ctx, 'a, N>,
+  m: &GpuModule<N>,
+  d_scalars: &TensorView<'a, [C::Scalar]>,
+  d_bases: &TensorView<'a, [C]>,
+  d_partial_sums: &mut TensorViewMut<'a, [C::Curve]>,
+) -> C::Curve {
+  let block_dim: u32 = (d_bases.len() as u32).min(MAX_BLOCK_DIM);
+  let mut sum = C::Curve::identity();
+  let mut grid_size = (d_bases.len() as u32).div_ceil(block_dim);
+  let mut result_size = d_bases.len() as u32;
+  assert!(d_partial_sums.len() as u32 == result_size * 2);
+  let config = gpu_host::gpu_config!(grid_size, 1, 1, block_dim, 1, 1, 0);
+  assert!((d_bases.len() as f64).ln() <= 14.0); // Only support up to 1024 buckets
+  rs_gpu::msm_kernel_opt::launch(config, ctx, m, d_scalars, d_bases, d_partial_sums).unwrap();
+  ctx.sync().unwrap();
+  let num_threads = current_num_threads();
+  if result_size as usize <= num_threads && result_size > 1 {
+    let mut cpu_sums = vec![C::Curve::identity(); result_size as usize];
+    let d_sums = d_partial_sums.split_at(result_size as usize).0;
+    d_sums
+      .copy_to_host(&mut cpu_sums)
+      .expect("copy from device failed");
+    sum = cpu_sums
+      .par_chunks(1)
+      .map(|v| v[0])
+      .reduce(C::Curve::identity, |s, evl| s + evl);
+  } else {
+    let mut ret_offset = 0;
+    let mut sums_start = 0;
+    while result_size > 1 {
+      sums_start += ret_offset;
+      ret_offset = result_size as usize;
+      let half_len = result_size.div_ceil(2);
+      let block_dim: u32 = (half_len).min(MAX_BLOCK_DIM);
+      grid_size = (half_len).div_ceil(block_dim);
+      result_size = grid_size;
+      let smem_size = (block_dim + 1) * size_of::<C::Curve>() as u32;
+      let (_, mut sum) = d_partial_sums.split_at_mut(sums_start);
+      let (cu_sum, mut next_sum) = sum.split_at_mut(ret_offset);
+      rs_gpu::reduce_sum::launch(
+        gpu_host::gpu_config!(grid_size, 1, 1, block_dim, 1, 1, smem_size),
+        ctx,
+        m,
+        &cu_sum,
+        &mut next_sum,
+      )
+      .expect("reduce_sum kernel launch failed");
+    }
     ctx.sync().unwrap();
+    d_partial_sums
+      .index(sums_start + ret_offset)
+      .copy_to_host(&mut sum)
+      .expect("copy from device failed");
   }
   sum
 }
@@ -593,7 +765,7 @@ fn compute_ln(a: usize) -> usize {
   }
 }
 
-/// cargo test --no-default-features --features rs_gpu
+/// cargo test --no-default-features --features rs_gpu provider::msm_gpu
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -606,32 +778,58 @@ mod tests {
   use halo2curves::CurveAffine;
   use rand_core::OsRng;
 
-  fn test_msm_ux_with<F: PrimeField, A: CurveAffine<ScalarExt = F>>() {
-    let n = 1;
+  fn test_msm_ux_with<F: PrimeField, A: CurveAffine<ScalarExt = F>>(n: usize) {
     let bases = (0..n)
       .map(|_| A::from(A::generator() * F::random(OsRng)))
       .collect::<Vec<_>>();
 
     //.map(|_| rand::random::<u64>() 1% (1 << bit_width))
-    for bit_width in [1] {
+    for bit_width in [16, 32, 48, 63] {
       let coeffs: Vec<u64> = (0..n).map(|_| 1 % (1 << bit_width)).collect::<Vec<_>>();
 
       let coeffs_scalar: Vec<F> = coeffs.iter().map(|b| F::from(*b)).collect::<Vec<_>>();
       let general_cpu = crate::provider::msm::msm(&coeffs_scalar, &bases);
       let general_gpu = msm_gpu(&coeffs_scalar, &bases);
-      let integer = msm_binary(&coeffs, &bases);
-      assert_eq!(general_cpu, integer);
+      let general_gpu_opt = msm_gpu_opt(&coeffs_scalar, &bases);
+      if bit_width == 1 {
+        let integer = msm_binary(&coeffs, &bases);
+        assert_eq!(general_cpu, integer);
+      }
+      assert_eq!(general_gpu_opt, general_gpu);
       assert_eq!(general_gpu, general_cpu);
+      assert_eq!(general_gpu_opt, general_cpu);
     }
   }
 
   #[test]
   fn test_gpu_msm_ux() {
-    test_msm_ux_with::<bn256::Scalar, bn256::Affine>();
+    test_msm_ux_with::<bn256::Scalar, bn256::Affine>(1024 * 16);
     /*test_msm_ux_with::<pallas::Scalar, pallas::Affine>();
     test_msm_ux_with::<vesta::Scalar, vesta::Affine>();
     test_msm_ux_with::<grumpkin::Scalar, grumpkin::Affine>();
     test_msm_ux_with::<secp256k1::Scalar, secp256k1::Affine>();
     test_msm_ux_with::<secq256k1::Scalar, secq256k1::Affine>();*/
+  }
+
+  #[test]
+  fn test_gpu_msm_ux_mid() {
+    test_msm_ux_with::<bn256::Scalar, bn256::Affine>(512);
+    /*test_msm_ux_with::<pallas::Scalar, pallas::Affine>();
+    test_msm_ux_with::<vesta::Scalar, vesta::Affine>();
+    test_msm_ux_with::<grumpkin::Scalar, grumpkin::Affine>();
+    test_msm_ux_with::<secp256k1::Scalar, secp256k1::Affine>();
+    test_msm_ux_with::<secq256k1::Scalar, secq256k1::Affine>();*/
+  }
+
+  #[test]
+  fn test_gpu_msm_single() {
+    use crate::provider::vesta;
+    test_msm_ux_with::<vesta::Scalar, vesta::Affine>(1);
+  }
+
+  #[test]
+  fn test_gpu_msm_small() {
+    use crate::provider::vesta;
+    test_msm_ux_with::<vesta::Scalar, vesta::Affine>(4);
   }
 }
