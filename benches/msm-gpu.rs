@@ -112,10 +112,7 @@ fn msm_benchmark<F: PrimeField, A: CurveAffine<ScalarExt = F>>(name: &str, c: &m
   group.finish();
 }
 
-fn msm_benchmark_native<F: PrimeField, A: CurveAffine<ScalarExt = F>>(
-  name: &str,
-  c: &mut Criterion,
-) {
+fn msm_benchmark_native<F: PrimeField, A: CurveAffine<ScalarExt = F>>(name: &str, c: &mut Criterion) {
   let sizes = [
     //1024,
     1024 * 16,
@@ -134,7 +131,7 @@ fn msm_benchmark_native<F: PrimeField, A: CurveAffine<ScalarExt = F>>(
 
       // CPU benchmark
       group.bench_with_input(
-        BenchmarkId::new(format!("{}-CPU", name), n),
+        BenchmarkId::new(format!("{}-{}-CPU", name, bit_width), n),
         &n,
         |b, &_size| {
           b.iter(|| {
@@ -157,12 +154,12 @@ fn msm_benchmark_native<F: PrimeField, A: CurveAffine<ScalarExt = F>>(
           .unwrap();
         let mut d_scalars = ctx.new_tensor_view(coeffs.as_slice()).unwrap();
         group.bench_with_input(
-          BenchmarkId::new(format!("n-{}-GPU", name), n),
+          BenchmarkId::new(format!("{}-{}-GPU", name, bit_width), n),
           &n,
           |b, &_size| {
             b.iter(|| {
               d_scalars.copy_from_host(coeffs.as_slice()).unwrap();
-              let _ = msm_gpu::msm_gpu_inner(ctx, m, &d_scalars, &d_bases, &mut d_partial_sums);
+              let _ = msm_gpu::msm_gpu_native_inner(ctx, m, &d_scalars, &d_bases, &mut d_partial_sums);
             });
           },
         );
@@ -215,8 +212,7 @@ fn msm_benchmark_opt<F: PrimeField, A: CurveAffine<ScalarExt = F>>(name: &str, c
           &n,
           |b, &_size| {
             b.iter(|| {
-              let _ =
-                msm_gpu::msm_gpu_general_inner(ctx, m, &d_scalars, &d_bases, &mut d_partial_sums);
+              let _ = msm_gpu::msm_gpu_general_inner(ctx, m, &d_scalars, &d_bases, &mut d_partial_sums, bit_width as usize, msm_gpu::MSMKernelGeneral);
             });
           },
         );
@@ -279,10 +275,11 @@ fn blitzar_benchmark(c: &mut Criterion) {
 fn msm_benchmarks(c: &mut Criterion) {
   #[cfg(feature = "blitzar")]
   blitzar_benchmark(c);
-  msm_benchmark_opt::<vesta::Scalar, vesta::Affine>("vesta", c);
+  msm_benchmark_native::<vesta::Scalar, vesta::Affine>("vesta", c);
   msm_benchmark::<vesta::Scalar, vesta::Affine>("vesta", c);
   msm_benchmark::<bn256::Scalar, bn256::Affine>("bn256", c);
   msm_benchmark::<grumpkin::Scalar, grumpkin::Affine>("grumpkin", c);
   msm_benchmark::<secp256k1::Scalar, secp256k1::Affine>("secp256k1", c);
   msm_benchmark::<secq256k1::Scalar, secq256k1::Affine>("secq256k1", c);
+  msm_benchmark_opt::<vesta::Scalar, vesta::Affine>("vesta", c);
 }

@@ -15,7 +15,21 @@ pub const MAX_BLOCK_DIM: u32 = 256;
 /// Maximum number of bits for bucket size in MSM with buckets
 pub const MAX_BUCKET_BITS: usize = 10;
 
-mod rs_gpu {
+/// Trait for MSM kernel implementations
+pub trait MSMKernel {
+  /// Launch the MSM kernel
+  fn launch<'ctx, 'a, C: CurveAffine, N: GpuCtxSpace, Config: SafeGpuConfig>(
+    config: Config,
+    ctx: &GpuCtxGuard<'ctx, 'a, N>,
+    m: &GpuModule<N>,
+    d_scalars: &TensorView<'a, [C::Scalar]>,
+    d_bases: &TensorView<'a, [C]>,
+    d_partial_sums: &mut TensorViewMut<'a, [C::Curve]>,
+    max_num_bits: usize,
+  ) -> Result<(), CudaError>;
+}
+
+pub(crate) mod rs_gpu {
   use super::*;
   #[allow(unused_imports)]
   use gpu::cg::*;
@@ -227,6 +241,23 @@ mod rs_gpu {
   }
 }
 
+/// Bucket-based MSM kernel implementation
+pub struct MSMKernelGeneral;
+
+impl MSMKernel for MSMKernelGeneral{
+  fn launch<'ctx, 'a, C: CurveAffine, N: GpuCtxSpace, Config: SafeGpuConfig>(
+    config: Config,
+    ctx: &GpuCtxGuard<'ctx, 'a, N>,
+    m: &GpuModule<N>,
+    d_scalars: &TensorView<'a, [C::Scalar]>,
+    d_bases: &TensorView<'a, [C]>,
+    d_partial_sums: &mut TensorViewMut<'a, [C::Curve]>,
+    _max_num_bits: usize,
+  ) -> Result<(), CudaError> {
+    rs_gpu::msm_kernel_general::launch(config, ctx, m, d_scalars, d_bases, d_partial_sums)
+  }
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 enum Bucket<C: CurveAffine> {
@@ -362,7 +393,7 @@ pub fn msm_gpu_general<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::
       .new_tensor_view(vec![C::Curve::identity(); bases.len() * 2].as_slice())
       .unwrap();
     let d_scalars = ctx.new_tensor_view(coeffs).unwrap();
-    msm_gpu_general_inner(ctx, m, &d_scalars, &d_bases, &mut d_partial_sums)
+    msm_gpu_general_inner(ctx, m, &d_scalars, &d_bases, &mut d_partial_sums, 0, MSMKernelGeneral)
   })
 }
 
@@ -477,7 +508,6 @@ pub fn msm_binary_gpu<
       .index(ret_offset)
       .copy_to_host(&mut sum)
       .expect("copy from device failed");
-    ctx.sync().unwrap();
   }
   sum
 }
@@ -530,7 +560,6 @@ pub fn msm_gpu_native_inner<'ctx, 'a, C: CurveAffine, N: GpuCtxSpace>(
       )
       .expect("reduce_sum kernel launch failed");
     }
-    ctx.sync().unwrap();
     d_partial_sums
       .index(sums_start + ret_offset)
       .copy_to_host(&mut sum)
@@ -540,12 +569,14 @@ pub fn msm_gpu_native_inner<'ctx, 'a, C: CurveAffine, N: GpuCtxSpace>(
 }
 
 /// bucket-based MSM using GPU acceleration.
-pub fn msm_gpu_general_inner<'ctx, 'a, C: CurveAffine, N: GpuCtxSpace>(
+pub fn msm_gpu_general_inner<'ctx, 'a, C: CurveAffine, N: GpuCtxSpace, F: MSMKernel>(
   ctx: &GpuCtxGuard<'ctx, 'a, N>,
   m: &GpuModule<N>,
   d_scalars: &TensorView<'a, [C::Scalar]>,
   d_bases: &TensorView<'a, [C]>,
   d_partial_sums: &mut TensorViewMut<'a, [C::Curve]>,
+  max_num_bits: usize,
+  _f: F,
 ) -> C::Curve {
   let block_dim: u32 = (d_bases.len() as u32).min(MAX_BLOCK_DIM);
   let mut sum = C::Curve::identity();
@@ -554,8 +585,7 @@ pub fn msm_gpu_general_inner<'ctx, 'a, C: CurveAffine, N: GpuCtxSpace>(
   assert!(d_partial_sums.len() as u32 == result_size * 2);
   let config = gpu_host::gpu_config!(grid_size, 1, 1, block_dim, 1, 1, 0);
   assert!((d_bases.len() as f64).ln() <= MAX_BUCKET_BITS as f64); // Only support up to 1024 buckets
-  rs_gpu::msm_kernel_general::launch(config, ctx, m, d_scalars, d_bases, d_partial_sums).unwrap();
-  ctx.sync().unwrap();
+  F::launch(config, ctx, m, d_scalars, d_bases, d_partial_sums, max_num_bits).unwrap();
   let num_threads = current_num_threads();
   if result_size as usize <= num_threads && result_size > 1 {
     let mut cpu_sums = vec![C::Curve::identity(); result_size as usize];
@@ -589,7 +619,6 @@ pub fn msm_gpu_general_inner<'ctx, 'a, C: CurveAffine, N: GpuCtxSpace>(
       )
       .expect("reduce_sum kernel launch failed");
     }
-    ctx.sync().unwrap();
     d_partial_sums
       .index(sums_start + ret_offset)
       .copy_to_host(&mut sum)
