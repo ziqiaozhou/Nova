@@ -33,10 +33,8 @@ byteorder = "1.4.3"
 thiserror = "2.0.11"
 once_cell = "1.18.0"
 itertools = "0.14.0"
-gpu = {path = "../crates/gpu", optional = true}
-#gpu = { git ="ssh://git@github.com/microsoft/seguru.git", package = "gpu", rev = "9ee59855c01f36cc14750d962ede3e3afb8d0df6", optional = true}
-gpu_host = {path = "../crates/gpu-host", optional = true}
-#gpu_host = {git = "ssh://git@github.com/MSRSSP/seguru.git", package = "gpu_host", rev = "9ee59855c01f36cc14750d962ede3e3afb8d0df6", optional = true}
+gpu = {path = "../../crates/gpu", optional = true}
+gpu_host = {path = "../../crates/gpu-host", optional = true}
 
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
